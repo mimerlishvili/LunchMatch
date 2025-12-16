@@ -240,15 +240,18 @@ def load_df(path_or_buf):
 # --------------------------------------------------------------
 # Session state init
 # --------------------------------------------------------------
+
 def init_state():
     defaults = {
         'step': 'setup',     # setup -> person -> waiting -> results
+        'mode': 'facilitator',  # or "participant"
         'team_name': '',
         'team_code': '',
-        'mode': 'facilitator',  # "facilitator" or "participant"
+        'team_code_locked': False,   # ✅ prevents re-prompting
+        'session_ready': False,      # ✅ indicates session created
         'current_index': 0,
         'people_names': [],
-        'people_prefs': [],  # kiosk-only flow
+        'people_prefs': [],
         'top3': None,
         'voting_stage': False,
         'selected_restaurant': None,
@@ -256,10 +259,14 @@ def init_state():
         'name_col': 'name',
         'cuisine_col': 'cuisine',
         'num_people': 5,
+        # participant-side session values:
+        'joined_team_code': '',
+        'participant_name': '',
     }
     for k, v in defaults.items():
-        if k not in st.session_state:
+      if k not in st.session_state:
             st.session_state[k] = v
+
 
 init_state()
 
@@ -271,153 +278,154 @@ def banner():
 # --------------------------------------------------------------
 # UI Components
 # --------------------------------------------------------------
+
 def render_setup():
     st.header("Step 1 — Team Setup")
-
     st.session_state['mode'] = st.radio(
         "Choose mode:",
         options=["facilitator", "participant"],
-        index=0 if st.session_state['mode'] != "participant" else 1,
-        help="Facilitator: runs the whole flow and aggregates. Participant: submits personal preferences and votes."
+        index=0 if st.session_state['mode'] != "participant" else 1
     )
 
-    # File uploader or default path (Facilitator should provide CSV; participants not required)
+    # Facilitator loads CSV (participants don't need it)
     default_csv_path = "restaurants_lehi.csv"
-    restaurant_df = None
-    try:
-        uploaded = st.file_uploader(
-            "Upload restaurants CSV (facilitator)",
-            type=["csv"],
-            help="If omitted, we'll look for 'restaurants_lehi.csv' next to app.py"
-        )
-        if uploaded is not None:
-            restaurant_df = load_df(uploaded)
-        elif os.path.exists(default_csv_path):
-            restaurant_df = load_df(default_csv_path)
-        elif st.session_state['mode'] == "facilitator":
-            st.warning("No CSV provided yet. Upload a file or place 'restaurants_lehi.csv' next to app.py.")
-            return
-    except Exception as e:
-        st.error(f"Error loading CSV: {e}")
-        return
+    restaurant_df = st.session_state.get('restaurant_df')
 
-    if restaurant_df is not None:
+    if st.session_state['mode'] == "facilitator":
+        try:
+            uploaded = st.file_uploader(
+                "Upload restaurants CSV (facilitator)",
+                type=["csv"],
+                help="Or place 'restaurants_lehi.csv' next to app.py"
+            )
+            if uploaded is not None:
+                restaurant_df = load_df(uploaded)
+            elif restaurant_df is None and os.path.exists(default_csv_path):
+                restaurant_df = load_df(default_csv_path)
+            if restaurant_df is None:
+                st.warning("No CSV provided yet. Upload a file or place 'restaurants_lehi.csv' next to app.py.")
+                st.stop()
+        except Exception as e:
+            st.error(f"Error loading CSV: {e}")
+            st.stop()
+
         st.session_state['restaurant_df'] = restaurant_df
         st.session_state['name_col'] = 'name' if 'name' in restaurant_df.columns else restaurant_df.columns[0]
         st.session_state['cuisine_col'] = 'cuisine' if 'cuisine' in restaurant_df.columns else None
 
-        # Validate expected binary columns exist
         missing = [c for c in BINARY_ITEMS if c not in restaurant_df.columns]
         if missing:
             st.error(f"CSV is missing expected columns: {missing}")
-            return
+            st.stop()
 
-    st.text_input("Team name (facilitator):", value=st.session_state['team_name'], key='team_name')
-    st.text_input("Team Code (share this with your team):", value=st.session_state['team_code'], key='team_code')
-    if st.session_state['team_code'].strip():
-        save_team(st.session_state['team_code'].strip(), st.session_state['team_name'])
+        # ✅ Create Session form (locks team code)
+        with st.form("create_session_form"):
+            team_name = st.text_input("Team name:", value=st.session_state['team_name'], key="team_name_input")
+            team_code_input = st.text_input("Team Code (share with your team):", value=st.session_state.get('team_code', ''), key="team_code_input")
+            create_clicked = st.form_submit_button("Create Session")
 
-    if st.session_state['mode'] == "facilitator":
-        st.slider("Select number of people (kiosk mode; optional):", min_value=1, max_value=20, value=st.session_state['num_people'], key='num_people')
-        st.info("Facilitator: Tell your team the Team Code. Participants will open this app, select Participant Mode, and enter the code.")
+        if create_clicked:
+            code = team_code_input.strip()
+            if not code:
+                st.error("Team Code is required.")
+                st.stop()
+            st.session_state['team_name'] = team_name
+            st.session_state['team_code'] = code
+            st.session_state['team_code_locked'] = True  # ✅ lock
+            st.session_state['session_ready'] = True
+            save_team(code, team_name)
+            st.success(f"Session created for Team Code: {code}")
+
+        st.slider("Select number of people (kiosk mode; optional):", 1, 20, st.session_state['num_people'], key='num_people')
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Start Kiosk Individual Pages ➜", type="primary"):
+            if st.button("Start Kiosk Individual Pages ➜", type="primary", disabled=not st.session_state['team_code_locked']):
                 n = max(1, min(20, int(st.session_state['num_people'])))
                 st.session_state['people_names'] = [f"Person {i+1}" for i in range(n)]
                 st.session_state['people_prefs'] = [None for _ in range(n)]
                 st.session_state['current_index'] = 0
                 st.session_state['step'] = 'person'
         with col_b:
-            if st.button("Skip to Results (aggregate multi-device submissions) ➜"):
+            if st.button("Skip to Results (aggregate multi-device submissions) ➜", disabled=not st.session_state['team_code_locked']):
                 st.session_state['step'] = 'results'
+
     else:
-        st.success("Participant Mode: enter the Team Code you received and submit your preferences below.")
+        # Participant join form
+        with st.form("join_session_form"):
+            team_code = st.text_input("Enter Team Code (from facilitator):", value=st.session_state.get('team_code', ''), key="join_team_code_input")
+            participant_name = st.text_input("Your name:", value=st.session_state.get('participant_name', ''), key="participant_name_input")
+            join_clicked = st.form_submit_button("Join Session")
+
+        if join_clicked:
+            code = team_code.strip()
+            name = participant_name.strip()
+            if not code:
+                st.error("Team Code is required to join.")
+                st.stop()
+            if not name:
+                st.error("Your name is required to join.")
+                st.stop()
+            st.session_state['team_code'] = code
+            st.session_state['participant_name'] = name
+            st.session_state['step'] = 'participant'
+            st.success(f"Joined session for Team Code: {code} as {name}")
+
 
 
 def render_person_page(index: int):
     st.header(f"Step 2 — Preferences for Person {index+1} (Kiosk Mode)")
 
-    # ---- Banner + Team Code input (so you don't have to go back to Setup)
-    # Show current mode/team code and allow setting team code here.
-    mode = st.session_state.get('mode', 'facilitator')
-    current_code = st.session_state.get('team_code', '')
-    st.info(f"Mode: **{mode.title()}** • Team Code: **{current_code or '—'}**")
-
-    team_code = st.text_input(
-        "Team Code (required; same one shared with participants):",
-        value=current_code
-    ).strip()
-    if team_code and team_code != current_code:
-        st.session_state['team_code'] = team_code
-
-    # ---- Hard stop if team code or CSV not ready
-    if not st.session_state.get('team_code'):
-        st.warning("Please enter a Team Code to continue.")
+    # Guards
+    if not st.session_state.get('team_code_locked'):
+        st.error("No session active. Go to Setup and click 'Create Session' to lock the Team Code.")
         st.stop()
-
     if st.session_state.get('restaurant_df') is None:
-        st.error("No restaurants CSV loaded. Go to Setup and upload/place 'restaurants_lehi.csv' next to app.py.")
+        st.error("No restaurants CSV loaded. Go to Setup (facilitator) to upload/place 'restaurants_lehi.csv'.")
         st.stop()
 
-    # ---- Person inputs
-    person_default_name = st.session_state['people_names'][index]
-    name = st.text_input("Your name:", value=person_default_name, key=f"person_name_{index}")
-    st.session_state['people_names'][index] = name if name.strip() else person_default_name
+    # ✅ Use a form to avoid reruns on each selection
+    with st.form(f"person_form_{index}"):
+        person_default_name = st.session_state['people_names'][index]
+        name = st.text_input("Your name:", value=person_default_name, key=f"person_name_{index}")
+        st.session_state['people_names'][index] = name if name.strip() else person_default_name
 
-    st.divider()
-    st.subheader("Cuisine preferences")
-    cuisine_choice = st.multiselect(
-        "Select favorite cuisines:",
-        CUISINE_TAGS,
-        key=f"{index}_cuisine"
-    )
+        st.divider()
+        st.subheader("Cuisine preferences")
+        cuisine_choice = st.multiselect("Select favorite cuisines:", CUISINE_TAGS, key=f"{index}_cuisine")
 
-    st.subheader("Dietary considerations")
-    dietary_votes = {}
-    for diet in ['vegetarian', 'healthy']:
-        importance = st.selectbox(
-            f"{diet.title()} importance:",
-            ['None', 'Preferred', 'Important'],
-            index=0,
-            key=f"{index}_{diet}"
-        )
-        dietary_votes[diet] = 2 if importance == 'Important' else 1 if importance == 'Preferred' else 0
+        st.subheader("Dietary considerations")
+        dietary_votes = {}
+        for diet in ['vegetarian', 'healthy']:
+            importance = st.selectbox(f"{diet.title()} importance:", ['None', 'Preferred', 'Important'], index=0, key=f"{index}_{diet}")
+            dietary_votes[diet] = 2 if importance == 'Important' else 1 if importance == 'Preferred' else 0
 
-    st.subheader("Item preferences")
-    item_votes = {}
-    for item in ['bowl', 'sandwich', 'pizza', 'burgers', 'fries', 'rice', 'salad', 'soup']:
-        pref = st.selectbox(
-            f"{item.title()} preference:",
-            ['Love', 'Maybe', 'Absolute No'],
-            index=1,
-            key=f"{index}_{item}"
-        )
-        item_votes[item] = 2 if pref == 'Love' else 1 if pref == 'Maybe' else 0
+        st.subheader("Item preferences")
+        item_votes = {}
+        for item in ['bowl', 'sandwich', 'pizza', 'burgers', 'fries', 'rice', 'salad', 'soup']:
+            pref = st.selectbox(f"{item.title()} preference:", ['Love', 'Maybe', 'Absolute No'], index=1, key=f"{index}_{item}")
+            item_votes[item] = 2 if pref == 'Love' else 1 if pref == 'Maybe' else 0
 
-    st.divider()
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("⬅ Back", disabled=index == 0):
-            st.session_state['current_index'] = max(0, index - 1)
-    with col2:
-        if st.button("Save & Next ➜", type="primary"):
-            payload = {
-                'name': st.session_state['people_names'][index],
-                'cuisines': cuisine_choice,
-                'dietary': dietary_votes,
-                'items': item_votes,
-            }
-            # Save to DB for multi-user aggregation (uses            # Save to DB for multi-user aggregation (uses Team Code just set above)
-            save_person_response(st.session_state['team_code'], payload)
-            st.session_state['people_prefs'][index] = payload
+        back = st.form_submit_button("⬅ Back")
+        next_ = st.form_submit_button("Save & Next ➜")
 
-            # Move to waiting or results
-            if index + 1 < len(st.session_state['people_names']):
-                st.session_state['current_index'] = index + 1
-                st.session_state['step'] = 'waiting'
-            else:
-                st.session_state['step'] = 'results'
+    # Navigation after submit
+    if back:
+        st.session_state['current_index'] = max(0, index - 1)
+    if next_:
+        payload = {
+            'name': st.session_state['people_names'][index],
+            'cuisines': cuisine_choice,
+            'dietary': dietary_votes,
+            'items': item_votes,
+        }
+        save_person_response(st.session_state['team_code'], payload)
+        st.session_state['people_prefs'][index] =        st.session_state['people_prefs'][index] = payload
+
+        if index + 1 < len(st.session_state['people_names']):
+            st.session_state['current_index'] = index + 1
+            st.session_state['step'] = 'waiting'
+        else:
+            st.session_state['step'] = 'results'
 
 def render_participant():
     st.header("Participant — Submit Preferences & Vote")
