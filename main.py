@@ -263,6 +263,11 @@ def init_state():
 
 init_state()
 
+def banner():
+    mode = st.session_state.get('mode', 'facilitator')
+    code = st.session_state.get('team_code', '')
+    st.info(f"Mode: **{mode.title()}** • Team Code: **{code or '—'}**")
+
 # --------------------------------------------------------------
 # UI Components
 # --------------------------------------------------------------
@@ -329,30 +334,65 @@ def render_setup():
     else:
         st.success("Participant Mode: enter the Team Code you received and submit your preferences below.")
 
+
 def render_person_page(index: int):
     st.header(f"Step 2 — Preferences for Person {index+1} (Kiosk Mode)")
-    if not st.session_state.get('team_code'):
-        st.warning("No Team Code set. Go back to Setup and enter a Team Code.")
-        return
 
+    # ---- Banner + Team Code input (so you don't have to go back to Setup)
+    # Show current mode/team code and allow setting team code here.
+    mode = st.session_state.get('mode', 'facilitator')
+    current_code = st.session_state.get('team_code', '')
+    st.info(f"Mode: **{mode.title()}** • Team Code: **{current_code or '—'}**")
+
+    team_code = st.text_input(
+        "Team Code (required; same one shared with participants):",
+        value=current_code
+    ).strip()
+    if team_code and team_code != current_code:
+        st.session_state['team_code'] = team_code
+
+    # ---- Hard stop if team code or CSV not ready
+    if not st.session_state.get('team_code'):
+        st.warning("Please enter a Team Code to continue.")
+        st.stop()
+
+    if st.session_state.get('restaurant_df') is None:
+        st.error("No restaurants CSV loaded. Go to Setup and upload/place 'restaurants_lehi.csv' next to app.py.")
+        st.stop()
+
+    # ---- Person inputs
     person_default_name = st.session_state['people_names'][index]
     name = st.text_input("Your name:", value=person_default_name, key=f"person_name_{index}")
     st.session_state['people_names'][index] = name if name.strip() else person_default_name
 
     st.divider()
     st.subheader("Cuisine preferences")
-    cuisine_choice = st.multiselect("Select favorite cuisines:", CUISINE_TAGS, key=f"{index}_cuisine")
+    cuisine_choice = st.multiselect(
+        "Select favorite cuisines:",
+        CUISINE_TAGS,
+        key=f"{index}_cuisine"
+    )
 
     st.subheader("Dietary considerations")
     dietary_votes = {}
     for diet in ['vegetarian', 'healthy']:
-        importance = st.selectbox(f"{diet.title()} importance:", ['None', 'Preferred', 'Important'], index=0, key=f"{index}_{diet}")
+        importance = st.selectbox(
+            f"{diet.title()} importance:",
+            ['None', 'Preferred', 'Important'],
+            index=0,
+            key=f"{index}_{diet}"
+        )
         dietary_votes[diet] = 2 if importance == 'Important' else 1 if importance == 'Preferred' else 0
 
     st.subheader("Item preferences")
     item_votes = {}
     for item in ['bowl', 'sandwich', 'pizza', 'burgers', 'fries', 'rice', 'salad', 'soup']:
-        pref = st.selectbox(f"{item.title()} preference:", ['Love', 'Maybe', 'Absolute No'], index=1, key=f"{index}_{item}")
+        pref = st.selectbox(
+            f"{item.title()} preference:",
+            ['Love', 'Maybe', 'Absolute No'],
+            index=1,
+            key=f"{index}_{item}"
+        )
         item_votes[item] = 2 if pref == 'Love' else 1 if pref == 'Maybe' else 0
 
     st.divider()
@@ -368,7 +408,7 @@ def render_person_page(index: int):
                 'dietary': dietary_votes,
                 'items': item_votes,
             }
-            # Save to DB for multi-user aggregation
+            # Save to DB for multi-user aggregation (uses            # Save to DB for multi-user aggregation (uses Team Code just set above)
             save_person_response(st.session_state['team_code'], payload)
             st.session_state['people_prefs'][index] = payload
 
