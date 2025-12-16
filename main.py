@@ -1,12 +1,11 @@
 
 # app.py
 # Streamlit app: Lehi Lunch Matcher 🍽️
-# 3-step flow:
-#   1) Setup -> ask team size (and CSV)
-#   2) Person-by-person pages -> each has own questions, Next to proceed
-#   3) Waiting page between people -> shows how many left, line-by-line
-#   4) Final page -> Top-3, concise "Matching on", voting & logging
-# --------------------------------------------------------------
+# Multi-user patch:
+#   - Team Code + shareable URL (?team=CODE&mode=participant)
+#   - SQLite backend for preferences and votes
+#   - Participant Mode (each person submits on their own device)
+#   - Facilitator Mode (aggregate + voting)
 
 import streamlit as st
 import pandas as pd
@@ -17,14 +16,17 @@ import math
 import hashlib
 import html
 import random
+import json
+import sqlite3
 from collections import Counter
+from contextlib import closing
 
 # --------------------------------------------------------------
 # Page configuration
 # --------------------------------------------------------------
 st.set_page_config(page_title="Lehi Lunch Matcher", layout="wide")
 st.title("Lehi Lunch Matcher 🍽️")
-st.caption("Three-step flow: Setup → Individual pages → Final results & voting")
+st.caption("Three-step flow: Setup → Individual pages → Final results & voting (multi-user enabled)")
 
 # --------------------------------------------------------------
 # Helpers & Config
@@ -110,6 +112,107 @@ def collapse_reasons(reason_tuples, top_n=3):
     return [pretty_label(r[0]) for r in sorted_reasons[:top_n]]
 
 # --------------------------------------------------------------
+# Query params (new/old Streamlit compatible)
+# --------------------------------------------------------------
+def get_query_params():
+    try:
+        return dict(st.query_params)  # Streamlit >= 1.32
+    except Exception:
+        return dict(st.experimental_get_query_params())
+
+def set_query_params(**kwargs):
+    try:
+        st.query_params.update(kwargs)  # Streamlit >= 1.32
+    except Exception:
+        st.experimental_set_query_params(**kwargs)
+
+def get_query_param(name, default=""):
+    params = get_query_params()
+    v = params.get(name)
+    if isinstance(v, list):
+        return v[0] if v else default
+    return v if v is not None else default
+
+# --------------------------------------------------------------
+# SQLite persistence (multi-user)
+# --------------------------------------------------------------
+DB_PATH = "lunch_match.db"
+
+def init_db():
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            team_code TEXT PRIMARY KEY,
+            team_name TEXT,
+            created_ts TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_code TEXT,
+            person_name TEXT,
+            prefs_json TEXT,
+            ts TEXT
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS votes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_code TEXT,
+            person_name TEXT,
+            choice TEXT,
+            ts TEXT
+        )
+        """)
+        conn.commit()
+
+def save_team(team_code: str, team_name: str):
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO teams (team_code, team_name, created_ts) VALUES (?, ?, ?)",
+            (team_code, team_name, datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+
+def save_person_response(team_code: str, person_dict: dict):
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        conn.execute(
+            "INSERT INTO responses (team_code, person_name, prefs_json, ts) VALUES (?, ?, ?, ?)",
+            (team_code, person_dict['name'], json.dumps(person_dict), datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+
+def load_team_responses(team_code: str):
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        rows = conn.execute(
+            "SELECT prefs_json FROM responses WHERE team_code = ? ORDER BY id ASC",
+            (team_code,)
+        ).fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+def save_vote(team_code: str, person_name: str, choice: str):
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        # Upsert-style: delete existing then insert
+        conn.execute("DELETE FROM votes WHERE team_code = ? AND person_name = ?", (team_code, person_name))
+        conn.execute(
+            "INSERT INTO votes (team_code, person_name, choice, ts) VALUES (?, ?, ?, ?)",
+            (team_code, person_name, choice, datetime.datetime.now().isoformat())
+        )
+        conn.commit()
+
+def load_votes(team_code: str):
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        rows = conn.execute(
+            "SELECT person_name, choice FROM votes WHERE team_code = ?",
+            (team_code,)
+        ).fetchall()
+    return {name: choice for name, choice in rows}
+
+init_db()
+
+# --------------------------------------------------------------
 # Data loading (with caching and optional uploader)
 # --------------------------------------------------------------
 @st.cache_data
@@ -128,13 +231,12 @@ def load_df(path_or_buf):
 # Session state init
 # --------------------------------------------------------------
 def init_state():
-    # IMPORTANT: Do NOT pre-set the widget key 'num_people' here.
     defaults = {
         'step': 'setup',     # setup -> person -> waiting -> results
         'team_name': '',
         'current_index': 0,
         'people_names': [],
-        'people_prefs': [],  # list of per-person dicts
+        'people_prefs': [],  # list of per-person dicts (facilitator flow only)
         'top3': None,
         'voting_stage': False,
         'votes': {},
@@ -142,6 +244,8 @@ def init_state():
         'restaurant_df': None,
         'name_col': 'name',
         'cuisine_col': 'cuisine',
+        'team_code': get_query_param("team", ""),
+        'mode': get_query_param("mode", "facilitator"),  # "facilitator" or "participant"
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -154,6 +258,15 @@ init_state()
 # --------------------------------------------------------------
 def render_setup():
     st.header("Step 1 — Team Setup")
+
+    # Mode selector (also synced to URL)
+    st.session_state['mode'] = st.radio(
+        "Choose mode:",
+        options=["facilitator", "participant"],
+        index=0 if st.session_state['mode'] != "participant" else 1,
+        help="Facilitator: runs the whole flow and aggregates. Participant: submits personal preferences and votes."
+    )
+    set_query_params(mode=st.session_state['mode'], team=st.session_state.get('team_code', ""))
 
     # File uploader or default path
     default_csv_path = "restaurants_lehi.csv"
@@ -186,20 +299,37 @@ def render_setup():
     st.session_state['name_col'] = name_col
     st.session_state['cuisine_col'] = cuisine_col
 
+    # Team name & team code
     st.text_input("Enter your team name:", value=st.session_state['team_name'], key='team_name')
+    team_code = st.text_input("Team code (share with your team):", value=st.session_state.get('team_code', ""))
+    if team_code.strip():
+        st.session_state['team_code'] = team_code.strip()
+        set_query_params(team=st.session_state['team_code'], mode=st.session_state['mode'])
+        save_team(st.session_state['team_code'], st.session_state['team_name'])
 
-    # ✅ Let the widget own its key; do not pre-set st.session_state['num_people']
-    # Safe default value = 5
-    st.slider("Select number of people in your team:", min_value=1, max_value=20, value=5, key='num_people')
+    # Shareable link
+    base_url = st.session_state.get('base_url', "")
+    # Attempt to get a base URL; fallback text if not available
+    try:
+        base_url = st.request.base_url
+    except Exception:
+        base_url = "[your app URL]"
+    share_link = f"{base_url}?team={st.session_state.get('team_code','')}&mode=participant"
+    st.info(f"Share this link with participants: **{share_link}**")
 
-    if st.button("Start Individual Pages ➜", type="primary"):
-        num_people = st.session_state.get('num_people', 5)
-        # Clamp defensively (should already be valid)
-        num_people = max(1, min(20, int(num_people)))
-        st.session_state['people_names'] = [f"Person {i+1}" for i in range(num_people)]
-        st.session_state['people_prefs'] = [None for _ in range(num_people)]
-        st.session_state['current_index'] = 0
-        st.session_state['step'] = 'person'
+    # Facilitator flow: number of people only used for kiosk mode; not required for multi-device
+    st.slider("Select number of people (kiosk mode):", min_value=1, max_value=20, value=5, key='num_people')
+
+    if st.session_state['mode'] == "facilitator":
+        if st.button("Start Individual Pages ➜", type="primary"):
+            num_people = st.session_state.get('num_people', 5)
+            num_people = max(1, min(20, int(num_people)))
+            st.session_state['people_names'] = [f"Person {i+1}" for i in range(num_people)]
+            st.session_state['people_prefs'] = [None for _ in range(num_people)]
+            st.session_state['current_index'] = 0
+            st.session_state['step'] = 'person'
+    else:
+        st.success("You're in Participant Mode. Use the link above to join; go to the Preferences page to submit.")
 
 def render_person_page(index: int):
     st.header(f"Step 2 — Preferences for Person {index+1}")
@@ -246,18 +376,53 @@ def render_person_page(index: int):
             st.session_state['current_index'] = max(0, index - 1)
     with col2:
         if st.button("Save & Next ➜", type="primary"):
-            st.session_state['people_prefs'][index] = {
+            payload = {
                 'name': st.session_state['people_names'][index],
                 'cuisines': cuisine_choice,
                 'dietary': dietary_votes,
                 'items': item_votes,
             }
+            # Save to DB for multi-user aggregation
+            if st.session_state.get('team_code'):
+                save_person_response(st.session_state['team_code'], payload)
+            st.session_state['people_prefs'][index] = payload
+
             # Move to waiting or results
             if index + 1 < len(st.session_state['people_names']):
                 st.session_state['current_index'] = index + 1
                 st.session_state['step'] = 'waiting'
             else:
                 st.session_state['step'] = 'results'
+
+def render_participant_form():
+    st.header("Participant — Submit Your Preferences")
+    team_code = st.session_state.get('team_code', "").strip()
+    if not team_code:
+        st.error("Missing team code. Ask the facilitator for the shared link with ?team=CODE.")
+        return
+
+    name = st.text_input("Your name:")
+    st.divider()
+    st.subheader("Cuisine preferences")
+    cuisine_choice = st.multiselect("Select favorite cuisines:", CUISINE_TAGS)
+
+    st.subheader("Dietary considerations")
+    dietary_votes = {}
+    for diet in ['vegetarian', 'healthy']:
+        importance = st.selectbox(f"{diet.title()} importance:", ['None', 'Preferred', 'Important'], index=0)
+        dietary_votes[diet] = 2 if importance == 'Important' else 1 if importance == 'Preferred' else 0
+
+    st.subheader("Item preferences")
+    item_votes = {}
+    for item in ['bowl', 'sandwich', 'pizza', 'burgers', 'fries', 'rice', 'salad', 'soup']:
+        pref = st.selectbox(f"{item.title()} preference:", ['Love', 'Maybe', 'Absolute No'], index=1, key=f"p_{item}")
+        item_votes[item] = 2 if pref == 'Love' else 1 if pref == 'Maybe' else 0
+
+    if st.button("Submit My Preferences", type="primary", disabled=not name.strip()):
+        payload = {'name': name.strip(), 'cuisines': cuisine_choice, 'dietary': dietary_votes, 'items': item_votes}
+        save_person_response(team_code, payload)
+        st.success("Thanks! Your preferences were submitted. You can close this tab.")
+        st.info("If the facilitator has opened the Results page, your submission will be included automatically.")
 
 def render_waiting():
     idx = st.session_state['current_index']
@@ -367,7 +532,7 @@ def score_restaurants(group_votes, restaurant_df, name_col, cuisine_col):
     return results_df
 
 # --------------------------------------------------------------
-# Final page: results + Top-3 voting
+# Final page: results + Top-3 voting (multi-user enabled)
 # --------------------------------------------------------------
 def render_results():
     st.header("Final Page — Top Matches & Voting")
@@ -376,7 +541,21 @@ def render_results():
     name_col = st.session_state['name_col']
     cuisine_col = st.session_state['cuisine_col']
 
-    group_votes = compute_group_votes(st.session_state['people_prefs'])
+    # Load responses from DB (multi-user) if team code provided; else use facilitator session
+    team_code = st.session_state.get('team_code', "").strip()
+    if team_code:
+        people_prefs = load_team_responses(team_code)
+        if not people_prefs and st.session_state['people_prefs']:
+            # fallback to kiosk-mode entries
+            people_prefs = [p for p in st.session_state['people_prefs'] if p]
+    else:
+        people_prefs = [p for p in st.session_state['people_prefs'] if p]
+
+    if not people_prefs:
+        st.warning("No preferences submitted yet. In Participant Mode, ensure people used the shared link.")
+        return
+
+    group_votes = compute_group_votes(people_prefs)
     results_df = score_restaurants(group_votes, restaurant_df, name_col, cuisine_col)
 
     if results_df['Score'].max() <= 0:
@@ -399,21 +578,21 @@ def render_results():
             top_reason_labels = collapse_reasons(row['Reasons'], top_n=3)
             st.write("**Matching on:** " + (", ".join(top_reason_labels) if top_reason_labels else "—"))
 
+    # Voting
     st.divider()
     st.write("### Team Voting — choose your favorite among the Top 3")
-
     options = [r['Restaurant'] for r in st.session_state['top3']]
     options_with_abstain = options + ["Abstain"]
-
-    if 'votes' not in st.session_state or not st.session_state['votes']:
-        # Initialize votes dict by names captured during per-person pages
-        st.session_state['votes'] = {p['name']: "Abstain" for p in st.session_state['people_prefs']}
+    # Preload votes from DB if team code is set
+    existing_votes = load_votes(team_code) if team_code else {}
+    # Build a list of participant names (from prefs)
+    participant_names = [p['name'] for p in people_prefs if p.get('name')]
 
     with st.form("vote_form"):
-        for i, person in enumerate(st.session_state['people_prefs']):
-            person_name = person['name']
-            default_choice = st.session_state['votes'].get(person_name, "Abstain")
-            st.session_state['votes'][person_name] = st.radio(
+        vote_inputs = {}
+        for i, person_name in enumerate(participant_names):
+            default_choice = existing_votes.get(person_name, "Abstain")
+            vote_inputs[person_name] = st.radio(
                 f"{person_name}'s vote:",
                 options_with_abstain,
                 index=options_with_abstain.index(default_choice) if default_choice in options_with_abstain else len(options_with_abstain) - 1,
@@ -422,11 +601,14 @@ def render_results():
         submitted = st.form_submit_button("Submit Votes")
 
     if submitted:
-        for i, person in enumerate(st.session_state['people_prefs']):
-            person_name = person['name']
-            st.session_state['votes'][person_name] = st.session_state.get(f"vote_{i}")
+        # Save to DB
+        if team_code:
+            for person_name, choice in vote_inputs.items():
+                save_vote(team_code, person_name, choice)
 
-        counts = Counter([v for v in st.session_state['votes'].values() if v and v != "Abstain"])
+        # Aggregate votes (use DB if available)
+        tallied = load_votes(team_code) if team_code else vote_inputs
+        counts = Counter([v for v in tallied.values() if v and v != "Abstain"])
 
         st.write("#### Voting Results")
         if counts:
@@ -453,13 +635,15 @@ def render_results():
         else:
             st.info("No votes cast (or everyone abstained). Please submit votes.")
 
+        # Log the decision (CSV append)
         log_entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "team_name": st.session_state['team_name'],
-            "people": [p['name'] for p in st.session_state['people_prefs']],
-            "group_prefs": compute_group_votes(st.session_state['people_prefs']),
+            "team_code": team_code,
+            "people": participant_names,
+            "group_prefs": compute_group_votes(people_prefs),
             "top_choices": options,
-            "votes": st.session_state['votes'],
+            "votes": load_votes(team_code) if team_code else vote_inputs,
             "selected": st.session_state.get('selected_restaurant', None),
         }
         history_df = pd.DataFrame([log_entry])
@@ -482,13 +666,18 @@ def render_results():
 # Router: which page to show
 # --------------------------------------------------------------
 step = st.session_state['step']
-if step == 'setup':
-    render_setup()
-elif step == 'person':
-    render_person_page(st.session_state['current_index'])
-elif step == 'waiting':
-    render_waiting()
-elif step == 'results':
-    render_results()
+
+# Participant Mode shortcut: show only the submission form
+if st.session_state.get('mode') == "participant":
+    render_participant_form()
 else:
-    st.session_state['step'] = 'setup'
+    if step == 'setup':
+        render_setup()
+    elif step == 'person':
+        render_person_page(st.session_state['current_index'])
+    elif step == 'waiting':
+        render_waiting()
+    elif step == 'results':
+        render_results()
+    else:
+        st.error(f"Unknown step: {step}")
