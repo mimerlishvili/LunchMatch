@@ -241,14 +241,15 @@ def load_df(path_or_buf):
 # Session state init
 # --------------------------------------------------------------
 
+
 def init_state():
     defaults = {
         'step': 'setup',     # setup -> person -> waiting -> results
         'mode': 'facilitator',  # or "participant"
         'team_name': '',
         'team_code': '',
-        'team_code_locked': False,   # ✅ prevents re-prompting
-        'session_ready': False,      # ✅ indicates session created
+        'team_code_locked': False,
+        'session_ready': False,
         'current_index': 0,
         'people_names': [],
         'people_prefs': [],
@@ -258,13 +259,15 @@ def init_state():
         'restaurant_df': None,
         'name_col': 'name',
         'cuisine_col': 'cuisine',
-        'num_people': 5,
-        # participant-side session values:
+        'num_people': 5,           # kiosk-only
+        'expected_count': 5,       # ✅ live session target submissions
+        'auto_compute': True,      # ✅ auto compute/publish Top-3 when threshold reached
+               # participant-side:
         'joined_team_code': '',
         'participant_name': '',
     }
     for k, v in defaults.items():
-      if k not in st.session_state:
+        if k not in st.session_state:
             st.session_state[k] = v
 
 
@@ -279,6 +282,7 @@ def banner():
 # UI Components
 # --------------------------------------------------------------
 
+
 def render_setup():
     st.header("Step 1 — Team Setup")
     st.session_state['mode'] = st.radio(
@@ -287,11 +291,11 @@ def render_setup():
         index=0 if st.session_state['mode'] != "participant" else 1
     )
 
-    # Facilitator loads CSV (participants don't need it)
     default_csv_path = "restaurants_lehi.csv"
     restaurant_df = st.session_state.get('restaurant_df')
 
     if st.session_state['mode'] == "facilitator":
+        # Load CSV (same as before)
         try:
             uploaded = st.file_uploader(
                 "Upload restaurants CSV (facilitator)",
@@ -318,10 +322,12 @@ def render_setup():
             st.error(f"CSV is missing expected columns: {missing}")
             st.stop()
 
-        # ✅ Create Session form (locks team code)
+        # Create Session form
         with st.form("create_session_form"):
-            team_name = st.text_input("Team name:", value=st.session_state['team_name'], key="team_name_input")
-            team_code_input = st.text_input("Team Code (share with your team):", value=st.session_state.get('team_code', ''), key="team_code_input")
+            team_name = st.text_input("Team name:", value=st.session_state['team_name'])
+            team_code_input = st.text_input("Team Code (share with your team):", value=st.session_state.get('team_code', ''))
+            expected = st.number_input("Expected number of participants", min_value=1, max_value=200, value=st.session_state['expected_count'])
+            auto = st.checkbox("Auto-compute & publish Top‑3 when expected count is reached", value=st.session_state['auto_compute'])
             create_clicked = st.form_submit_button("Create Session")
 
         if create_clicked:
@@ -329,46 +335,52 @@ def render_setup():
             if not code:
                 st.error("Team Code is required.")
                 st.stop()
+            # Lock and save
             st.session_state['team_name'] = team_name
             st.session_state['team_code'] = code
-            st.session_state['team_code_locked'] = True  # ✅ lock
+            st.session_state['expected_count'] = int(expected)
+            st.session_state['auto_compute'] = bool(auto)
+            st.session_state['team_code_locked'] = True
             st.session_state['session_ready'] = True
             save_team(code, team_name)
             st.success(f"Session created for Team Code: {code}")
+            # 👉 Go straight to live waiting/progress view
+            st.session_state['step'] = 'live_waiting'
 
-        st.slider("Select number of people (kiosk mode; optional):", 1, 20, st.session_state['num_people'], key='num_people')
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("Start Kiosk Individual Pages ➜", type="primary", disabled=not st.session_state['team_code_locked']):
-                n = max(1, min(20, int(st.session_state['num_people'])))
-                st.session_state['people_names'] = [f"Person {i+1}" for i in range(n)]
-                st.session_state['people_prefs'] = [None for _ in range(n)]
-                st.session_state['current_index'] = 0
-                st.session_state['step'] = 'person'
-        with col_b:
-            if st.button("Skip to Results (aggregate multi-device submissions) ➜", disabled=not st.session_state['team_code_locked']):
-                st.session_state['step'] = 'results'
+        st.divider()
+        # Optional kiosk flow (still available)
+        st.slider("Kiosk: number of people (optional)", 1, 20, st.session_state['num_people'], key='num_people')
+        c1, c2 = st.columns(2)
+        with c1:
+            st.button("Start Kiosk Individual Pages ➜", type="primary",
+                      disabled=not st.session_state['team_code_locked'],
+                      on_click=lambda: (st.session_state.update({
+                          'people_names': [f"Person {i+1}" for i in range(max(1, min(20, int(st.session_state['num_people']))))],
+                          'people_prefs': [None] * max(1, min(20, int(st.session_state['num_people']))),
+                          'current_index': 0,
+                          'step': 'person'
+                      })))
+        with c2:
+            st.button("Open Results (manual compute) ➜",
+                      disabled=not st.session_state['team_code_locked'],
+                      on_click=lambda: st.session_state.update({'step': 'results'}))
 
     else:
-        # Participant join form
-        with st.form("join_session_form"):
-            team_code = st.text_input("Enter Team Code (from facilitator):", value=st.session_state.get('team_code', ''), key="join_team_code_input")
-            participant_name = st.text_input("Your name:", value=st.session_state.get('participant_name', ''), key="participant_name_input")
-            join_clicked = st.form_submit_button("Join Session")
+        st.info("Participant mode: enter Team Code to submit preferences and vote.")
+        team_code = st.text_input("Team Code:", value=st.session_state.get('joined_team_code', '')).strip()
+        name = st.text_input("Your Name:", value=st.session_state.get('participant_name', '')).strip()
 
-        if join_clicked:
-            code = team_code.strip()
-            name = participant_name.strip()
-            if not code:
+        if st.button("Join Team"):
+            if not team_code:
                 st.error("Team Code is required to join.")
                 st.stop()
             if not name:
-                st.error("Your name is required to join.")
+                st.error("Your Name is required to join.")
                 st.stop()
-            st.session_state['team_code'] = code
+            st.session_state['joined_team_code'] = team_code
             st.session_state['participant_name'] = name
+            st.success(f"Joined team with code: {team_code}")
             st.session_state['step'] = 'participant'
-            st.success(f"Joined session for Team Code: {code} as {name}")
 
 
 
@@ -480,34 +492,42 @@ def render_participant():
         st.bar_chart(tally_df.set_index("Restaurant"))
         st.table(tally_df)
 
-def render_waiting():
-    idx = st.session_state['current_index']
-    total = len(st.session_state['people_names'])
 
-    st.header("Waiting Page")
-    submitted = sum(1 for p in st.session_state['people_prefs'] if p is not None)
-    left = total - submitted
+def render_live_waiting():
+    st.header("Live session — Waiting for submissions")
+    code = st.session_state.get('team_code', '').strip()
+    if not code or not st.session_state.get('team_code_locked'):
+        st.error("No active session. Go to Setup and Create Session first.")
+        st.stop()
 
-    st.write(f"**Submitted:** {submitted}/{total}")
-    st.progress(submitted / total if total else 0)
+    expected = int(st.session_state.get('expected_count', 0)) or 0
+    prefs = load_team_responses(code)  # from SQLite
+    submitted = len([p for p in prefs if p and p.get('name')])
+    left = max(0, expected - submitted) if expected else None
 
-    st.write("### Status by person")
-    for i in range(total):
-        name = st.session_state['people_names'][i]
-        status = "✅ Completed" if st.session_state['people_prefs'][i] is not None else "⏳ Pending"
-        st.write(f"- {name}: {status}")
+    st.write(f"**Team Code:** `{code}` • **Submitted:** {submitted}" + (f"/{expected}" if expected else ""))
+    if expected:
+        st.progress(min(1.0, submitted / expected))
 
-    st.info(f"{left} {'person' if left == 1 else 'people'} left to submit.")
+    st.write("### Submissions")
+    if prefs:
+        names = [p.get('name', '(unknown)') for p in prefs]
+        for n in names:
+            st.write(f"- ✅ {n}")
+    else:
+        st.info("No submissions yet.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Go to Next Person ➜", type="primary"):
-            st.session_state['step'] = 'person'
-    with col2:
-        if st.button("Restart Setup"):
-            init_state()
-            st.session_state['step'] = 'setup'
+    # Auto compute when threshold reached
+    auto = bool(st.session_state.get('auto_compute'))
+    if expected and auto and submitted >= expected:
+        st.success("Expected count reached. Computing results…")
+        st.session_state['step'] = 'results'
+        st.experimental_rerun()  # force compute immediately
 
+    # Manual compute button
+    if st.button("Compute results now ➜", type="primary"):
+        st.session_state['step'] = 'results'
+        st.experimental_rerun()
 # --------------------------------------------------------------
 # Aggregation & Scoring
 # --------------------------------------------------------------
@@ -590,33 +610,29 @@ def score_restaurants(group_votes, restaurant_df, name_col, cuisine_col):
 # --------------------------------------------------------------
 # Final page: results + Top-3 voting (multi-user enabled)
 # --------------------------------------------------------------
+
 def render_results():
     st.header("Final Page — Top Matches & Voting")
-
-    team_code = st.text_input("Team Code:", value=st.session_state.get('team_code', "")).strip()
-    if team_code and team_code != st.session_state.get('team_code'):
-        st.session_state['team_code'] = team_code
+    code = st.session_state.get('team_code', '').strip()
+    if not code:
+        st.error("No Team Code set. Go to Setup and Create Session.")
+        st.stop()
 
     restaurant_df = st.session_state.get('restaurant_df')
     name_col = st.session_state.get('name_col', 'name')
     cuisine_col = st.session_state.get('cuisine_col', 'cuisine')
-
     if restaurant_df is None:
-        st.warning("No restaurants CSV loaded. Go to Setup (facilitator) to provide a CSV.")
-        return
+        st.error("No restaurants CSV loaded. Upload or place 'restaurants_lehi.csv' on Setup.")
+        st.stop()
 
-    # Prefer multi-device DB responses; fallback to kiosk entries
-    people_prefs = load_team_responses(team_code) if team_code else []
-    if not people_prefs and st.session_state['people_prefs']:
-        people_prefs = [p for p in st.session_state['people_prefs'] if p]
-
+    # Always aggregate from DB (live submissions)
+    people_prefs = load_team_responses(code)
     if not people_prefs:
-        st.warning("No preferences submitted yet. Ensure participants used the Team Code.")
-        return
+        st.warning("No preferences submitted yet for this team.")
+        st.stop()
 
     group_votes = compute_group_votes(people_prefs)
     results_df = score_restaurants(group_votes, restaurant_df, name_col, cuisine_col)
-
     if results_df['Score'].max() <= 0:
         st.warning("No matching restaurants found based on your team's preferences. Please adjust preferences.")
         return
@@ -626,26 +642,26 @@ def render_results():
     st.session_state['top3'] = top3_records
     st.session_state['voting_stage'] = True
 
-    # Publish Top‑3 to DB so participants can vote independently
-    save_top3(team_code, top3_records)
+    # ✅ Publish Top‑3 so participants can see & vote
+    save_top3(code, top3_records)
 
     st.write("### Top 3 Matches")
-    card_cols = st.columns(len(top3_records))
-    for col, row in zip(card_cols, top3_records):
-        with col:
+    cols = st.columns(len(top3_records))
+    for c, row in zip(cols, top3_records):
+        with c:
             st.subheader(row['Restaurant'])
             if row.get('Cuisine'):
                 st.caption(f"Cuisine: {row['Cuisine']}")
             st.write(f"**Score:** {row['Score']:.2f}")
-            top_reason_labels = collapse_reasons(row['Reasons'], top_n=3)
-            st.write("**Matching on:** " + (", ".join(top_reason_labels) if top_reason_labels else "—"))
+            labels = collapse_reasons(row['Reasons'], top_n=3)
+            st.write("**Matching on:** " + (", ".join(labels) if labels else "—"))
 
     st.divider()
     st.write("### Team Voting — choose your favorite among the Top‑3")
     options = [r['Restaurant'] for r in st.session_state['top3']]
     options_with_abstain = options + ["Abstain"]
 
-    existing_votes = load_votes(team_code)
+    existing_votes = load_votes(code)
     participant_names = [p['name'] for p in people_prefs if p.get('name')]
 
     with st.form("vote_form"):
@@ -662,9 +678,9 @@ def render_results():
 
     if submitted:
         for person_name, choice in vote_inputs.items():
-            save_vote(team_code, person_name, choice)
+            save_vote(code, person_name, choice)
 
-        tallied = load_votes(team_code)
+        tallied = load_votes(code)
         counts = Counter([v for v in tallied.values() if v and v != "Abstain"])
 
         st.write("#### Voting Results")
@@ -675,7 +691,6 @@ def render_results():
 
             max_votes = max(counts.values())
             winners = [r for r, c in counts.items() if c == max_votes]
-
             if len(winners) == 1:
                 winner = winners[0]
                 st.success(f"Winner: **{winner}** with {max_votes} votes! 🎉")
@@ -689,15 +704,15 @@ def render_results():
         else:
             st.info("No votes cast (or everyone abstained). Please submit votes.")
 
-        # Log decision (CSV append)
+        # Log decision
         log_entry = {
             "timestamp": datetime.datetime.now().isoformat(),
             "team_name": st.session_state['team_name'],
-            "team_code": team_code,
+            "team_code": code,
             "people": participant_names,
-            "group_prefs": compute_group_votes(people_prefs),
+            "group_prefs": group_votes,
             "top_choices": options,
-            "votes": load_votes(team_code),
+            "votes": load_votes(code),
             "selected": st.session_state.get('selected_restaurant', None),
         }
         history_df = pd.DataFrame([log_entry])
@@ -707,18 +722,17 @@ def render_results():
             history_df.to_csv("lunch_history.csv", index=False)
         st.caption("Decision logged to **lunch_history.csv**.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Restart Setup"):
-            init_state()
-            st.session_state['step'] = 'setup'
-    with col2:
-        if st.button("Back to Waiting"):
-            st.session_state['step'] = 'waiting'
+    c1, c2 = st.columns(2)
+    with c1:
+        st.button("Back to Live Waiting", on_click=lambda: st.session_state.update({'step': 'live_waiting'}))
+    with c2:
+        st.button("Restart Setup", on_click=lambda: (init_state(), st
+.experimental_rerun()))
 
 # --------------------------------------------------------------
 # Router: which page to show
 # --------------------------------------------------------------
+
 step = st.session_state['step']
 mode = st.session_state['mode']
 
@@ -727,10 +741,12 @@ if mode == "participant":
 else:
     if step == 'setup':
         render_setup()
+    elif step == 'live_waiting':         # ✅ new
+        render_live_waiting()
     elif step == 'person':
         render_person_page(st.session_state['current_index'])
     elif step == 'waiting':
-        render_waiting()
+        render_live_waiting()                  # (kiosk-only, you can keep or remove)
     elif step == 'results':
         render_results()
     else:
